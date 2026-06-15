@@ -18,7 +18,57 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import json
+import os
+
+from dotenv import load_dotenv
+from groq import Groq
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+load_dotenv()
+
+
+# ── query parser ──────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Use the Groq LLM to extract structured search parameters from the query.
+
+    Returns a dict with keys:
+        description (str)       — what the user is looking for
+        size        (str|None)  — size filter, or None
+        max_price   (float|None)— price ceiling, or None
+    """
+    prompt = (
+        "Extract search parameters from this thrift shopping query. "
+        "Return ONLY a JSON object with exactly these keys: "
+        '{"description": "<keywords>", "size": "<size or null>", "max_price": <number or null>}. '
+        "description should be the item keywords only (no size or price). "
+        "size should be null if not mentioned. "
+        "max_price should be a number if mentioned, otherwise null.\n\n"
+        f"Query: {query}"
+    )
+    api_key = os.environ.get("GROQ_API_KEY")
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=100,
+    )
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    parsed = json.loads(raw.strip())
+    return {
+        "description": parsed.get("description", query),
+        "size": parsed.get("size") or None,
+        "max_price": float(parsed["max_price"]) if parsed.get("max_price") is not None else None,
+    }
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +142,46 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 1: Parse query into structured parameters
+    try:
+        session["parsed"] = _parse_query(query)
+    except Exception as e:
+        session["error"] = f"Couldn't parse your query: {e}. Try rephrasing it."
+        return session
+
+    p = session["parsed"]
+
+    # Step 2: Search listings
+    session["search_results"] = search_listings(
+        p["description"], p["size"], p["max_price"]
+    )
+
+    # BRANCH: no results → set error and return early
+    if not session["search_results"]:
+        size_note = f", size {p['size']}" if p["size"] else ""
+        price_note = f" under ${p['max_price']:.0f}" if p["max_price"] else ""
+        session["error"] = (
+            f"No listings found for '{p['description']}'{size_note}{price_note}. "
+            f"Try removing the size filter or raising your price limit."
+        )
+        return session
+
+    # Step 3: Select top result
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 4: Suggest outfit (wardrobe flows in from session, never re-prompted)
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], session["wardrobe"]
+    )
+
+    # Step 5: Create fit card
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 6: Return completed session
     return session
 
 
