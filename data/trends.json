@@ -1,0 +1,27 @@
+{
+  "_description": "Mock trend data representing current fashion trends. Used by get_trending_styles() in tools.py.",
+  "trending_now": [
+    "quiet luxury",
+    "90s grunge revival",
+    "Y2K throwback",
+    "gorpcore",
+    "mob wife aesthetic",
+    "coquette"
+  ],
+  "trending_colors": [
+    "chocolate brown",
+    "burgundy",
+    "cream",
+    "forest green",
+    "cobalt blue"
+  ],
+  "trending_silhouettes": [
+    "oversized blazers",
+    "wide-leg trousers",
+    "midi skirts",
+    "platform shoes",
+    "baggy cargo pants"
+  ],
+  "source": "mock_trend_data",
+  "note": "Simulates what a real trend-scraping tool would return from a fashion platform."
+}

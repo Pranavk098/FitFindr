@@ -74,6 +74,33 @@ Open the URL shown in your terminal (usually `http://localhost:7860`).
 
 ---
 
+### `price_compare(item, all_listings)` *(stretch)*
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `item` | `dict` | The selected listing dict being evaluated |
+| `all_listings` | `list[dict]` | Full listings dataset from `load_listings()` |
+
+**Returns:** `str` — verdict with reasoning, e.g. `"$18.00 — Great deal — 45% below the $32.50 median for tops."` Computes the median price of all same-category listings (excluding the item itself), then classifies the difference: ≥20% below → "Great deal", 5–20% below → "Fair price", ±5% → "Average price", 5–20% above → "Slightly pricey", >20% above → "Pricey". Returns a fallback string if no comparable listings exist.
+
+**Purpose:** Lets the user immediately see whether the price is a deal relative to the rest of the mock dataset, without having to compare manually.
+
+---
+
+### `get_trending_styles(size=None)` *(stretch)*
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `size` | `str \| None` | Reserved for future size-range filtering; currently unused |
+
+**Returns:** `str` — a formatted summary of trending aesthetics, colors, and silhouettes loaded from `data/trends.json`, e.g. `"Trending aesthetics: quiet luxury, 90s grunge revival, Y2K throwback, gorpcore. Hot colors right now: chocolate brown, burgundy, cream. Popular silhouettes: oversized blazers, wide-leg trousers, midi skirts."` Returns `""` on any failure (soft fail).
+
+**Data source:** `data/trends.json` — mock data simulating what a real fashion-platform trend scraper would return. Contains `trending_now` (aesthetics list), `trending_colors`, and `trending_silhouettes` fields. The string is injected directly into the `suggest_outfit` LLM prompt so the outfit recommendation visibly references current trends.
+
+**Purpose:** Gives the outfit suggestion trend-awareness so the LLM can note when a combination taps into a current aesthetic (e.g., "this taps into the Y2K throwback trend").
+
+---
+
 ## Planning Loop
 
 The agent uses a **sequential loop with one conditional branch** — it does not call all three tools unconditionally.
@@ -99,7 +126,11 @@ run_agent(query, wardrobe)
   └─ Step 6: return session
 ```
 
-**The key decision:** After `search_listings` runs, the loop checks `if not results`. If true, it sets an error message and returns the session immediately — `suggest_outfit` and `create_fit_card` are never called with empty input. If results exist, the loop proceeds linearly through Steps 3–5 without further branching (because `suggest_outfit` handles its own empty-wardrobe case internally).
+**The key decisions:**
+
+1. After `search_listings`, if results are empty **and** a size was specified → **retry without size filter** *(stretch)*. If the retry finds results, set a note and continue. If retry is also empty → set error and return early.
+2. If results are empty with no size to retry → set error and return early immediately.
+3. Steps 6–9 always run when a result exists — `price_compare`, trend-aware `suggest_outfit`, `create_fit_card`, then profile save.
 
 **Query parsing:** The user's raw natural language query (e.g., `"vintage graphic tee under $30, size M"`) is parsed by the LLM at `temperature=0.0` into a structured dict with `description`, `size`, and `max_price` fields. This handles natural phrasing like `"under thirty bucks"` or `"medium-ish"` better than regex.
 
@@ -114,13 +145,18 @@ All state lives in a single `session` dict created at the start of each `run_age
 | `session["query"]` | `_new_session` | `_parse_query` |
 | `session["parsed"]` | `_parse_query` | `search_listings` call |
 | `session["search_results"]` | `search_listings` | empty-check branch; `results[0]` selection |
-| `session["selected_item"]` | `results[0]` assignment | `suggest_outfit`, `create_fit_card`, Gradio UI |
+| `session["selected_item"]` | `results[0]` assignment | `suggest_outfit`, `create_fit_card`, `price_compare`, Gradio UI |
 | `session["wardrobe"]` | `_new_session` | `suggest_outfit` |
 | `session["outfit_suggestion"]` | `suggest_outfit` | `create_fit_card` |
 | `session["fit_card"]` | `create_fit_card` | Gradio UI (fit card panel) |
 | `session["error"]` | empty-results branch | Gradio `handle_query` (shows in listing panel) |
+| `session["retry_note"]` | retry branch *(stretch)* | Gradio UI (appended to listing panel) |
+| `session["price_verdict"]` | `price_compare` *(stretch)* | Gradio UI (extras panel) |
+| `session["trend_context"]` | `get_trending_styles` *(stretch)* | `suggest_outfit` prompt |
+| `session["style_profile"]` | `load_style_profile` *(stretch)* | `suggest_outfit` prompt; `update_profile_from_session` |
+| `session["profile_summary"]` | `profile_summary()` *(stretch)* | Gradio UI (extras panel) |
 
-The item found in Step 2 flows directly into Steps 4 and 5 as `session["selected_item"]` — no repeated look-ups, no user re-entry.
+The item found in the search step flows directly into `suggest_outfit`, `create_fit_card`, and `price_compare` as `session["selected_item"]` — no repeated look-ups, no user re-entry.
 
 ---
 
@@ -155,6 +191,57 @@ input: Y2K Baby Tee + empty wardrobe
 → "Oh my gosh, I'm obsessed with this Y2K baby tee... pair it with high-waisted
    jeans or a flowy skirt... add layered pieces like a cardigan or a denim jacket..."
 → no exception raised, non-empty string returned
+```
+
+---
+
+### `search_listings` — retry with loosened constraints *(stretch)*
+
+**Failure mode:** `search_listings` returns `[]` and the query included a size filter.
+
+**Agent response:** Retries `search_listings` without the size parameter, keeping any price ceiling. If the retry finds results, sets `session["retry_note"]` and continues normally — the user sees a warning in the listing panel. If the retry also returns empty, falls through to the standard no-results error.
+
+**Example from testing:**
+```
+query: "vintage tee size XXXL under $25"
+→ First search (size=XXXL): []
+→ Retry (no size): 20 results found
+→ session["retry_note"]: "No results found for size XXXL — retried without size filter
+   and found 20 match(es). Showing results in any size."
+→ session["selected_item"]: Y2K Baby Tee (top keyword match)
+```
+
+---
+
+### `price_compare` — no comparable listings *(stretch)*
+
+**Failure mode:** No other listings share the same category as the selected item.
+
+**Agent response:** Returns `"No comparable listings found for category '{category}'."` — shown in the extras panel. Session continues normally.
+
+---
+
+### `get_trending_styles` — data unavailable *(stretch)*
+
+**Failure mode:** `trends.json` is missing or unreadable.
+
+**Agent response:** Returns `""` silently. `suggest_outfit` receives an empty `trend_context` and produces a normal outfit suggestion without trend references. Interaction continues without interruption.
+
+---
+
+### Style Profile Memory *(stretch)*
+
+**How it works:** At the end of each successful `run_agent()` call, `update_profile_from_session()` extracts the selected item's `style_tags` and `colors` and appends them to `data/style_profile.json`. On the next query, `load_style_profile()` reads the file and passes the accumulated preferences into the `suggest_outfit` prompt — so the second interaction benefits from the first without any user re-entry.
+
+**Storage:** `data/style_profile.json` — flat JSON with `preferred_styles` (list), `preferred_colors` (list), `recent_items` (list, capped at 5), `notes` (str). Managed by `utils/style_profile.py`. The UI includes a "Clear saved profile" button that resets the file to empty.
+
+**Example showing second query uses first session's preferences:**
+```
+Session 1: searches for Y2K Baby Tee → profile saves styles: [y2k, vintage, graphic tee, cottagecore]
+Session 2: searches for 90s track jacket → suggest_outfit prompt now includes:
+  "User's style preferences: Preferred styles: y2k, vintage, graphic tee, cottagecore
+   Preferred colors: white, pink, purple"
+  → LLM outfit suggestions reference the user's established aesthetic
 ```
 
 ---
@@ -195,6 +282,22 @@ create_fit_card("", results[0])
 
 ---
 
+## Stretch Features
+
+### Price Comparison Tool (+2pts)
+`price_compare(item, all_listings)` computes the median price of all same-category listings and classifies the item's price relative to it (Great deal / Fair / Average / Pricey). Result shown in the extras panel below the three main outputs. Comparisons use Python's `statistics.median()` — no LLM, pure data.
+
+### Style Profile Memory (+2pts)
+After each successful search, `utils/style_profile.py:update_profile_from_session()` saves the selected item's style tags and colors to `data/style_profile.json`. The next query loads this file and passes it to `suggest_outfit` as additional prompt context — so the LLM knows the user gravitates toward Y2K or grunge without the user re-stating it. The extras panel shows the current profile state, and a "Clear saved profile" button resets it.
+
+### Trend Awareness Tool (+2pts)
+`get_trending_styles()` loads `data/trends.json` (mock data simulating a fashion-platform trend feed) and returns a formatted summary of trending aesthetics, colors, and silhouettes. This string is passed directly into the `suggest_outfit` LLM prompt. The outfit suggestion visibly references current trends — e.g., "this taps into the Y2K throwback trend" or "gorpcore-inspired". Trend data source is documented in `data/trends.json`.
+
+### Retry Logic with Fallback (+1pt)
+If `search_listings` returns empty results **and** the query included a size filter, the planning loop automatically retries without the size constraint, keeping any price ceiling. The user sees a warning in the listing panel: `"⚠️ No results found for size XXXL — retried without size filter and found 20 match(es). Showing results in any size."` If the retry also returns empty, the normal no-results error is shown.
+
+---
+
 ## Running Tests
 
 ```bash
@@ -209,17 +312,21 @@ pytest tests/ -v
 
 ```
 .
-├── agent.py          # Planning loop: run_agent(), _parse_query(), _new_session()
-├── app.py            # Gradio interface: handle_query() + pre-built layout
-├── tools.py          # Three tool implementations
-├── planning.md       # Design spec: tools, loop, state, error handling, diagram
+├── agent.py               # Planning loop: run_agent(), _parse_query(), _new_session()
+├── app.py                 # Gradio interface: handle_query() + 4-panel layout
+├── tools.py               # 5 tools: search_listings, suggest_outfit, create_fit_card,
+│                          #           price_compare, get_trending_styles
+├── planning.md            # Design spec: tools, loop, state, error handling, diagram
 ├── data/
-│   ├── listings.json         # 40 mock thrift listings
-│   └── wardrobe_schema.json  # Wardrobe schema + example/empty wardrobe
+│   ├── listings.json          # 40 mock thrift listings
+│   ├── wardrobe_schema.json   # Wardrobe schema + example/empty wardrobe
+│   ├── trends.json            # Mock trend data for get_trending_styles()
+│   └── style_profile.json     # Persisted user style profile (updated each session)
 ├── utils/
-│   └── data_loader.py        # load_listings(), get_example_wardrobe(), get_empty_wardrobe()
+│   ├── data_loader.py         # load_listings(), get_example_wardrobe(), load_trends()
+│   └── style_profile.py       # load/save/update/clear profile; profile_summary()
 └── tests/
-    └── test_tools.py         # 15 pytest tests for all tools and failure modes
+    └── test_tools.py          # 15 pytest tests for all tools and failure modes
 ```
 
 ---

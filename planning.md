@@ -84,11 +84,60 @@ Both failure cases return a string. The agent always stores whatever `create_fit
 
 ---
 
-### Additional Tools (if any)
+### Stretch Tool 4: price_compare
 
-None for the required milestone.
+**What it does:**
+Compares a listing's price to the median price of all other listings in the same category. Returns a verdict string with the percentage difference and the category median so the user can judge whether the find is a deal.
 
-Stretch feature planned: **price_comparison(item, all_listings)** — given the selected item, compares its price to the median price of all listings in the same category and returns a short verdict string (e.g., "Great deal — 40% below median for tops ($22 vs $37)"). Would be inserted between Steps 3 and 4 in the planning loop.
+**Input parameters:**
+- `item` (dict): The selected listing dict. Uses `item["price"]`, `item["category"]`, and `item["id"]` (to exclude itself from the comparison set).
+- `all_listings` (list[dict]): The full listings dataset from `load_listings()`. Filtered to same-category items before computing the median.
+
+**What it returns:**
+A single string, e.g.: `"$18.00 — Great deal — 45% below the $32.50 median for tops."` Thresholds: ≥20% below → "Great deal", 5–20% below → "Fair price", ±5% → "Average price", 5–20% above → "Slightly pricey", >20% above → "Pricey". Returns a fallback string if no comparable listings exist — never raises.
+
+**What happens if it fails or returns nothing:**
+Returns `"No comparable listings found for category '{category}'."` No exception. Stored in `session["price_verdict"]` and shown in the extras panel.
+
+---
+
+### Stretch Tool 5: get_trending_styles
+
+**What it does:**
+Loads `data/trends.json` (mock trend data representing current fashion platform trends) and returns a formatted summary string of trending aesthetics, colors, and silhouettes. This string is injected into the `suggest_outfit` prompt so the LLM can reference current trends when building outfit combinations.
+
+**Input parameters:**
+- `size` (str | None): Reserved for future size-range filtering. Currently unused — all trends returned regardless of size.
+
+**What it returns:**
+A single string, e.g.: `"Trending aesthetics: quiet luxury, 90s grunge revival, Y2K throwback, gorpcore. Hot colors right now: chocolate brown, burgundy, cream. Popular silhouettes: oversized blazers, wide-leg trousers, midi skirts."` Returns `""` on failure (soft fail — trends are optional context, not critical path).
+
+**Data source:** `data/trends.json` — mock data simulating what a real fashion platform scraper would return. Contains `trending_now` (aesthetics), `trending_colors`, and `trending_silhouettes` fields.
+
+**What happens if it fails or returns nothing:**
+Returns `""` silently. The planning loop checks `if trend_context` before passing it to `suggest_outfit`, so an empty string means no trend context is added to the prompt. The interaction continues normally.
+
+---
+
+### Stretch Feature: Style Profile Memory
+
+**What it does:**
+Persists style signals (style tags and colors from items the user has browsed) to `data/style_profile.json` after each successful interaction. On the next query, the saved profile is loaded and passed to `suggest_outfit` as additional context so the LLM can reference the user's established preferences without re-entry.
+
+**Storage:** `data/style_profile.json` — flat JSON with keys `preferred_styles` (list), `preferred_colors` (list), `recent_items` (list, max 5), `notes` (str). Updated by `utils/style_profile.py:update_profile_from_session()` at the end of each successful `run_agent()` call.
+
+**What happens if profile is missing or corrupt:** `load_style_profile()` returns the empty profile dict — the interaction continues without preference context.
+
+---
+
+### Stretch Feature: Retry Logic with Fallback
+
+**What it does:**
+If `search_listings` returns an empty list AND the query included a size filter, the planning loop automatically retries without the size constraint. The user sees a note in the listing panel explaining what was adjusted.
+
+**When it triggers:** Only when `p["size"]` is not None AND first search returned `[]`. If the retry also returns `[]`, the normal error path is taken.
+
+**What the user sees:** `"⚠️ No results found for size XXXL — retried without size filter and found 20 match(es). Showing results in any size."` in the listing panel.
 
 ---
 
@@ -96,40 +145,61 @@ Stretch feature planned: **price_comparison(item, all_listings)** — given the 
 
 **How does your agent decide which tool to call next?**
 
-The planning loop is a linear sequence with one conditional branch (the empty-results early exit). Written as pseudocode:
+The planning loop is a linear sequence with two conditional branches (retry on empty results, and early exit if retry also fails). Written as pseudocode:
 
 ```
 def run_agent(query, wardrobe):
     session = _new_session(query, wardrobe)
 
-    # Step 1 — Parse query
+    # Step 1 — Load style profile from disk
+    session["style_profile"] = load_style_profile()
+
+    # Step 2 — Get trending styles (soft fail: returns "" on error)
+    session["trend_context"] = get_trending_styles()
+
+    # Step 3 — Parse query
     parsed = llm_parse_query(query)
-    # parsed = {"description": str, "size": str | None, "max_price": float | None}
     session["parsed"] = parsed
 
-    # Step 2 — Search listings
+    # Step 4 — Search listings
     results = search_listings(parsed["description"], parsed["size"], parsed["max_price"])
     session["search_results"] = results
 
-    # BRANCH: if no results, stop here
-    if not results:
+    # Step 4a — [STRETCH] Retry without size filter if size caused empty results
+    if not results and parsed["size"]:
+        retry = search_listings(parsed["description"], size=None, max_price=parsed["max_price"])
+        if retry:
+            session["search_results"] = retry
+            session["retry_note"] = f"No results for size {parsed['size']} — retried without size filter, found {len(retry)} match(es)."
+
+    # Step 4b — If still empty, early exit
+    if not session["search_results"]:
         session["error"] = f"No listings found for '{parsed['description']}'. Try loosening filters."
-        return session   # ← early exit; suggest_outfit and create_fit_card are never called
+        return session
 
-    # Step 3 — Select top result
-    session["selected_item"] = results[0]
+    # Step 5 — Select top result
+    session["selected_item"] = session["search_results"][0]
 
-    # Step 4 — Suggest outfit (always runs if we reach here)
-    session["outfit_suggestion"] = suggest_outfit(results[0], wardrobe)
+    # Step 6 — [STRETCH] Price comparison
+    session["price_verdict"] = price_compare(session["selected_item"], load_listings())
 
-    # Step 5 — Create fit card (always runs if we reach here)
-    session["fit_card"] = create_fit_card(session["outfit_suggestion"], results[0])
+    # Step 7 — Suggest outfit (passes trend context + style profile)
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], wardrobe,
+        trend_context=session["trend_context"],
+        style_profile=session["style_profile"],
+    )
 
-    # Step 6 — Done
+    # Step 8 — Create fit card
+    session["fit_card"] = create_fit_card(session["outfit_suggestion"], session["selected_item"])
+
+    # Step 9 — [STRETCH] Persist style signals for next session
+    update_profile_from_session(session)
+
     return session
 ```
 
-The loop is "done" when either `session["error"]` is set (early exit) or `session["fit_card"]` is populated. Steps 4 and 5 always run when results exist — there is no mid-loop branch for `suggest_outfit` failure because that tool handles its own errors internally and always returns a non-empty string.
+The loop has two branches: the retry branch (Step 4a) loosens the size constraint and continues; the early-exit branch (Step 4b) sets an error and returns if results are still empty after retry. Steps 6–9 always run when a result exists.
 
 ---
 
@@ -161,10 +231,14 @@ For each tool, describe the specific failure mode you're handling and what the a
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
 | `search_listings` | Returns `[]` — no listing passes the price/size/keyword filters | Agent sets `session["error"] = "No listings found for '{description}' (size={size}, max ${max_price}). Try removing the size filter or raising your price limit."` and returns immediately. `suggest_outfit` and `create_fit_card` are never called. |
+| `search_listings` | Returns `[]` but a size filter was specified | **[STRETCH]** Agent retries `search_listings` without the size parameter. If retry finds results, sets `session["retry_note"]` and continues. If retry also returns `[]`, falls through to the error path above. |
 | `suggest_outfit` | `wardrobe["items"]` is empty | Tool branches to a different LLM prompt asking for general styling advice instead of named wardrobe pairings. Returns a non-empty string; agent continues to `create_fit_card` normally. |
 | `suggest_outfit` | LLM API call raises an exception | Tool catches the exception and returns `"Couldn't generate outfit suggestions right now. Try pairing this with neutral basics."` Agent stores this in `session["outfit_suggestion"]` and continues. |
 | `create_fit_card` | `outfit` is empty or whitespace-only | Tool returns `"No outfit suggestion available — can't generate a fit card."` without calling the LLM. Agent stores this in `session["fit_card"]`. |
 | `create_fit_card` | LLM API call raises an exception | Tool catches the exception and returns `"Fit card unavailable right now."` Agent stores this in `session["fit_card"]`. |
+| `get_trending_styles` | `trends.json` missing or malformed | Returns `""` silently. `suggest_outfit` receives an empty `trend_context` and produces a normal outfit suggestion without trend references. |
+| `price_compare` | No same-category listings in dataset | Returns `"No comparable listings found for category '{category}'."` Stored in `session["price_verdict"]` and shown in extras panel. |
+| `load_style_profile` | Profile file missing or corrupt JSON | Returns empty profile dict `{"preferred_styles": [], ...}`. `suggest_outfit` receives no preference context; session proceeds normally. |
 
 ---
 
@@ -176,47 +250,54 @@ User query (natural language)
         ▼
 run_agent(query, wardrobe)
         │
-        ├─► [Step 1] llm_parse_query(query)
-        │           │
+        ├─► [Step 1] load_style_profile()
+        │           └── session["style_profile"] = {preferred_styles, colors, recent_items}
+        │
+        ├─► [Step 2] get_trending_styles()        ← STRETCH
+        │           └── session["trend_context"] = "Trending: quiet luxury, Y2K..."
+        │
+        ├─► [Step 3] llm_parse_query(query)
         │           └── session["parsed"] = {description, size, max_price}
         │
-        ├─► [Step 2] search_listings(description, size, max_price)
+        ├─► [Step 4] search_listings(description, size, max_price)
         │           │
-        │           ├── results == []?
-        │           │       │
-        │           │       └──► session["error"] = "No listings found..."
-        │           │                    │
-        │           │                    └──► return session   ← EARLY EXIT
+        │           ├── results == [] AND size specified?
+        │           │       └──► [STRETCH] retry without size filter
+        │           │               ├── retry found results?
+        │           │               │       └── session["retry_note"] = "retried..."
+        │           │               └── retry still empty?
+        │           │                       └──► session["error"] → EARLY EXIT
         │           │
-        │           └── results = [item1, item2, ...]
-        │                    │
-        │                    └── session["search_results"] = results
+        │           └── results == [] (no size to retry)?
+        │                   └──► session["error"] → EARLY EXIT
         │
-        ├─► [Step 3] session["selected_item"] = results[0]
+        ├─► [Step 5] session["selected_item"] = results[0]
         │
-        ├─► [Step 4] suggest_outfit(selected_item, wardrobe)
+        ├─► [Step 6] price_compare(selected_item, all_listings)    ← STRETCH
+        │           └── session["price_verdict"] = "$18 — Great deal..."
+        │
+        ├─► [Step 7] suggest_outfit(item, wardrobe, trend_context, style_profile)
         │           │
-        │           ├── wardrobe["items"] == []?
-        │           │       └──► LLM: general styling advice
-        │           │
-        │           └── wardrobe has items?
-        │                   └──► LLM: specific outfit with named wardrobe pieces
-        │           │
+        │           ├── wardrobe empty? → LLM: general styling advice
+        │           └── wardrobe has items? → LLM: named wardrobe pieces + trend refs
         │           └── session["outfit_suggestion"] = "<LLM response>"
         │
-        ├─► [Step 5] create_fit_card(outfit_suggestion, selected_item)
-        │           │
-        │           └── session["fit_card"] = "<LLM caption at temp=0.9>"
+        ├─► [Step 8] create_fit_card(outfit_suggestion, selected_item)
+        │           └── session["fit_card"] = "<caption at temp=0.9>"
+        │
+        ├─► [Step 9] update_profile_from_session(session)          ← STRETCH
+        │           └── saves style tags + colors to data/style_profile.json
         │
         └─► return session
                     │
                     ▼
             handle_query() in app.py
                     │
-        ┌───────────┼───────────────────┐
-        ▼           ▼                   ▼
-  listing panel  outfit panel      fit card panel
-  (or error msg) (outfit_suggestion) (fit_card)
+        ┌───────────┼──────────────┬──────────────────────┐
+        ▼           ▼              ▼                       ▼
+  listing panel  outfit panel  fit card panel      extras panel
+  + retry note   (trend-aware) (caption)          price + trends
+  (or error msg)                                  + profile status
 ```
 
 ---

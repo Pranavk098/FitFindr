@@ -72,6 +72,22 @@ def get_empty_wardrobe() -> dict:
     return schema["empty_wardrobe"]
 
 
+def load_trends() -> dict:
+    """
+    Load mock trend data used by get_trending_styles().
+
+    Returns:
+        A dict with keys:
+        - trending_now (list[str]): current aesthetic/style trends
+        - trending_colors (list[str]): hot colors this season
+        - trending_silhouettes (list[str]): popular silhouettes
+        - source (str): data source identifier
+    """
+    path = os.path.join(_DATA_DIR, "trends.json")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 # --- Quick sanity check ---
 if __name__ == "__main__":
     listings = load_listings()
